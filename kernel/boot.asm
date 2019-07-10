@@ -27,14 +27,20 @@ start:
 bits 32
 ;;  St
 start32:
-
-
-	mov eax, 20
+	;; setup the basic stack
 	mov esp, 0x1000
 	mov ebp, esp
 
 
+	mov eax, 0
+	cpuid
+	hlt
+
+
+
 	sub esp, 16
+
+
 
 
 	mov esi, 0
@@ -58,18 +64,31 @@ start32:
 
 	hlt
 
-
+;; Poke special port to print registers
 print_regs:
 	mov dx, 0x3f8
 	out dx, eax
 	ret
 
-
+;; Poke special port to print the time to the host
 print_time:
 	rdtsc
 	out 0xfe, eax
 	ret
 
+
+
+check_cpuid:
+	pushfd                               ;Save EFLAGS
+	pushfd                               ;Store EFLAGS
+	xor dword [esp],0x00200000           ;Invert the ID bit in stored EFLAGS
+	popfd                                ;Load stored EFLAGS (with ID bit inverted)
+	pushfd                               ;Store EFLAGS again (ID bit may or may not be inverted)
+	pop eax                              ;eax = modified EFLAGS (ID bit may or may not be inverted)
+	xor eax,[esp]                        ;eax = whichever bits were changed
+	popfd                                ;Restore original EFLAGS
+	and eax,0x00200000                   ;eax = zero if ID bit can't be changed, else non-zero
+	ret
 
 
 NULL_DESC:
@@ -95,4 +114,5 @@ DATA_DESC:
 gdtr:
     LIMIT dw gdtr - NULL_DESC - 1 ; length of GDT
     BASE  dd NULL_DESC   ; base of GDT
+
 

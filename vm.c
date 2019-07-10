@@ -1,3 +1,6 @@
+
+#define MAP_ANONYMOUS 0x20 /* Don't use a file.  */
+#include <cpuid.h>
 #include <err.h>
 #include <fcntl.h>
 #include <linux/kvm.h>
@@ -43,10 +46,91 @@ void print_regs(struct kvm_regs *regs) {
   printf("\n");
 }
 
+struct cpuid_regs {
+  int eax;
+  int ebx;
+  int ecx;
+  int edx;
+};
+
+static inline void host_cpuid(struct cpuid_regs *regs) {
+  __asm__ volatile("cpuid"
+                   : "=a"(regs->eax), "=b"(regs->ebx), "=c"(regs->ecx),
+                     "=d"(regs->edx)
+                   : "0"(regs->eax), "2"(regs->ecx));
+}
+
+#define MAX_KVM_CPUID_ENTRIES 100
+
+static void filter_cpuid(struct kvm_cpuid2 *kvm_cpuid) {
+  unsigned int i;
+  struct cpuid_regs regs;
+
+  /*
+   * Filter CPUID functions that are not supported by the hypervisor.
+   */
+  for (i = 0; i < kvm_cpuid->nent; i++) {
+    struct kvm_cpuid_entry2 *entry = &kvm_cpuid->entries[i];
+
+    switch (entry->function) {
+      case 0:
+
+        regs = (struct cpuid_regs){
+            .eax = 0x00,
+
+        };
+        host_cpuid(&regs);
+        /* Vendor name */
+        entry->ebx = regs.ebx;
+        entry->ecx = regs.ecx;
+        entry->edx = regs.edx;
+        break;
+      case 1:
+        /* Set X86_FEATURE_HYPERVISOR */
+        if (entry->index == 0) entry->ecx |= (1 << 31);
+        /* Set CPUID_EXT_TSC_DEADLINE_TIMER*/
+        if (entry->index == 0) entry->ecx |= (1 << 24);
+        break;
+      case 6:
+        /* Clear X86_FEATURE_EPB */
+        entry->ecx = entry->ecx & ~(1 << 3);
+        break;
+      case 10: { /* Architectural Performance Monitoring */
+        union cpuid10_eax {
+          struct {
+            unsigned int version_id : 8;
+            unsigned int num_counters : 8;
+            unsigned int bit_width : 8;
+            unsigned int mask_length : 8;
+          } split;
+          unsigned int full;
+        } eax;
+
+        /*
+         * If the host has perf system running,
+         * but no architectural events available
+         * through kvm pmu -- disable perf support,
+         * thus guest won't even try to access msr
+         * registers.
+         */
+        if (entry->eax) {
+          eax.full = entry->eax;
+          if (eax.split.version_id != 2 || !eax.split.num_counters)
+            entry->eax = 0;
+        }
+        break;
+      }
+      default:
+        /* Keep the CPUID function as -is */
+        break;
+    };
+  }
+}
+
 static int run_kernel(unsigned char *code, int len) {
   static int kvm = -1;
 
-  if (kvm == -1) kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
+  if (kvm == -1) kvm = open("/dev/kvm", O_RDWR);
 
   int ret;
 
@@ -63,6 +147,7 @@ static int run_kernel(unsigned char *code, int len) {
   // KVM gives us a handle to this VM in the form of a file descriptor:
   int vmfd = ioctl(kvm, KVM_CREATE_VM, (unsigned long)0);
 
+  // 16mb of memory
   size_t mem_size = 16 * 1024 * 1024;
 
   int code_start = 0x1000;
@@ -79,8 +164,6 @@ static int run_kernel(unsigned char *code, int len) {
   // We then need to copy our machine code into it:
   memcpy(mem + code_start, code, len);
 
-  // And finally tell the KVM virtual machine about its spacious new 4096-byte
-  // memory:
   struct kvm_userspace_memory_region code_region = {
       .slot = 0,
       .guest_phys_addr = 0x0,
@@ -88,21 +171,7 @@ static int run_kernel(unsigned char *code, int len) {
       .userspace_addr = (uint64_t)mem,
   };
   ioctl(vmfd, KVM_SET_USER_MEMORY_REGION, &code_region);
-
-  // Now that we have a VM, with memory containing code to run, we need to
-  // create a virtual CPU to run that code. A KVM virtual CPU represents the
-  // state of one emulated CPU, including processor registers and other
-  // execution state. Again, KVM gives us a handle to this VCPU in the form of a
-  // file descriptor:
   int vcpufd = ioctl(vmfd, KVM_CREATE_VCPU, (unsigned long)0);
-
-  // Each virtual CPU has an associated struct kvm_run data structure, used to
-  // communicate information about the CPU between the kernel and user space. In
-  // particular, whenever hardware virtualization stops (called a "vmexit"),
-  // such as to emulate some virtual hardware, the kvm_run structure will
-  // contain information about why it stopped. We map this structure into user
-  // space using mmap(), but first, we need to know how much memory to map,
-  // which KVM tells us with the KVM_GET_VCPU_MMAP_SIZE ioctl():
   int mmap_size = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, NULL);
 
   struct kvm_run *run =
@@ -122,6 +191,22 @@ static int run_kernel(unsigned char *code, int len) {
       .rflags = 0x2,
   };
   ioctl(vcpufd, KVM_SET_REGS, &regs);
+
+  struct kvm_cpuid2 *kvm_cpuid;
+
+  kvm_cpuid = calloc(1, sizeof(*kvm_cpuid) + MAX_KVM_CPUID_ENTRIES *
+                                                 sizeof(*kvm_cpuid->entries));
+
+  kvm_cpuid->nent = MAX_KVM_CPUID_ENTRIES;
+  if (ioctl(kvm, KVM_GET_SUPPORTED_CPUID, kvm_cpuid) < 0)
+    err(1, "KVM_GET_SUPPORTED_CPUID failed");
+
+  filter_cpuid(kvm_cpuid);
+
+  if (ioctl(vcpufd, KVM_SET_CPUID2, kvm_cpuid) < 0)
+    err(1, "KVM_SET_CPUID2 failed");
+
+  free(kvm_cpuid);
 
   int result = 0;
 
